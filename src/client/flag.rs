@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Flag {
     Tentative,
     Permanent,
@@ -12,6 +12,7 @@ impl Flag {
     }
 }
 
+#[derive(Clone)]
 pub struct FlagStore {
     flags: BTreeMap<usize, Flag>,
 }

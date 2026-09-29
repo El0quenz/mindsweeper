@@ -2,13 +2,16 @@ use float_ord::FloatOrd;
 use gloo::storage::{LocalStorage, Storage};
 use itertools::Itertools;
 use js_sys::Date;
-use mindsweeper::{analyzer::Analyzer, server::*, utils::*};
+use mindsweeper::{analyzer::Analyzer, explain::TileId, server::*, utils::*};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use strum::{Display, EnumIter, IntoEnumIterator};
 use tinyvec::array_vec;
 use web_sys::{Event, HtmlDialogElement, HtmlInputElement, HtmlSelectElement, MouseEvent};
 use yew::{html::Scope, prelude::*};
+
+mod coach;
+use coach::*;
 
 mod flag;
 use flag::*;
@@ -40,6 +43,13 @@ pub enum Msg {
     SetNumbersStyle(NumbersStyle),
     SetSubtractFlags(bool),
     SwapControls,
+    Hint,
+    Undo,
+    ToggleCoach,
+    FocusCulprit,
+    SelectMove(usize),
+    SelectStep(usize),
+    ToggleEarlier,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default, EnumIter, Display)]
@@ -91,6 +101,9 @@ pub struct Client<Game: Oracle> {
     last_revealed: Vec<usize>,
     controls_swapped: bool,
     touching_tile: Option<TileTouch>,
+    coach: Coach,
+    /// The game as it was just before the most recent click (used to take back a loss).
+    undo: Option<UndoPoint<Game>>,
 }
 
 mod storage_keys {
@@ -98,6 +111,12 @@ mod storage_keys {
     pub static THEME: &str = "theme";
     pub static CLOSED_DIALOG: &str = "closed_dialog";
     pub static BEST_TIMES: &str = "best_times";
+}
+
+struct UndoPoint<Game: Oracle> {
+    game: Game,
+    flags: FlagStore,
+    last_revealed: Vec<usize>,
 }
 
 struct PreparedGame<Game: Oracle> {
@@ -169,10 +188,40 @@ impl<Game: Oracle> Client<Game> {
         }
     }
 
+    /// Remembers the state just before a player action so that a losing click can be undone.
+    fn save_undo_point(&mut self) {
+        if let Some(game) = self.game.as_ref().filter(|g| g.status().is_ongoing()) {
+            self.undo = Some(UndoPoint {
+                game: game.clone(),
+                flags: self.flags.clone(),
+                last_revealed: self.last_revealed.clone(),
+            });
+        }
+    }
+
+    /// Takes back the click that lost the game.
+    fn undo_last_click(&mut self) {
+        if !self.is_lost() {
+            return;
+        }
+        if let Some(point) = self.undo.take() {
+            self.game = Some(point.game);
+            self.flags = point.flags;
+            self.last_revealed = point.last_revealed;
+            self.coach.keep_after_undo();
+        }
+    }
+
     fn click(&mut self, tile_id: usize) {
+        self.save_undo_point();
+        self.click_inner(tile_id);
+    }
+
+    fn click_inner(&mut self, tile_id: usize) {
         if self.flags.contains(tile_id) {
             return;
         }
+        self.coach.clear_hint();
         let game = self
             .game
             .get_or_insert_with(|| match self.prepared_game.take() {
@@ -248,12 +297,13 @@ impl<Game: Oracle> Client<Game> {
                 }
             }
             for tile_to_click in tiles_to_click {
-                self.click(tile_to_click);
+                self.click_inner(tile_to_click);
             }
         }
     }
 
     fn secondary_click(&mut self, tile_id: usize) {
+        self.save_undo_point();
         let Some(game) = &self.game else {
             return;
         };
@@ -301,19 +351,27 @@ impl<Game: Oracle> Client<Game> {
                 }
             }
             for tile_to_click in tiles_to_click {
-                self.click(tile_to_click);
+                self.click_inner(tile_to_click);
             }
         }
     }
 
     fn new_game(&mut self) {
         self.game = None;
+        self.undo = None;
         self.flags.clear();
         self.last_revealed.clear();
         self.controls_swapped = false;
+        self.coach.reset();
     }
 
-    fn view_tile(&self, tile_id: usize, analyzer: Option<&Analyzer>, scope: &Scope<Self>) -> Html {
+    fn view_tile(
+        &self,
+        tile_id: usize,
+        analyzer: Option<&Analyzer>,
+        highlights: &HashMap<TileId, Highlight>,
+        scope: &Scope<Self>,
+    ) -> Html {
         const FLAG_SYMBOL: char = '⚑';
         const MINE_SYMBOL: char = '💣';
 
@@ -415,11 +473,17 @@ impl<Game: Oracle> Client<Game> {
         }
 
         tile_classes.extend(bg_class);
+        let highlight = highlights.get(&tile_id);
+        if let Some(highlight) = highlight {
+            tile_classes.push(highlight.class());
+        }
+        let label = highlight.and_then(|h| h.label).map(|c| c.to_string());
 
         html! {
             <td key={tile_id}
                 id={format!("tile-{tile_id}")}
                 title={tooltip}
+                data-label={label}
                 class={tile_classes}
                 onmousedown={scope.callback(move |e: MouseEvent|
                     Msg::TileMouseEvent { tile_id, button: e.button(), buttons: e.buttons() }
@@ -444,6 +508,31 @@ impl<Game: Oracle> Client<Game> {
         match &self.game {
             Some(game) if game.status().is_won() => 0,
             _ => self.game_config.grid_config.mine_count() as isize - self.flags.len() as isize,
+        }
+    }
+
+    fn is_lost(&self) -> bool {
+        self.game.as_ref().is_some_and(|game| game.status().is_lost())
+    }
+
+    /// Runs the (comparatively expensive) post-mortem analysis once, when a game is lost.
+    fn refresh_coach(&mut self) {
+        if self.is_lost() {
+            if self.coach.post.is_none() {
+                let game = self.game.as_ref().expect("lost game exists");
+                let flags = &self.flags;
+                let post = PostMortem::build(
+                    self.game_config,
+                    game,
+                    |tile_id| flags.contains(tile_id),
+                    &self.last_revealed,
+                );
+                self.coach.set_post_mortem(post);
+            }
+        } else if self.coach.post.is_some() {
+            self.coach.post = None;
+            self.coach.card = None;
+            self.coach.focus = None;
         }
     }
 
@@ -476,6 +565,8 @@ impl<Game: Oracle> Component for Client<Game> {
             last_revealed: vec![],
             controls_swapped: false,
             touching_tile: None,
+            coach: Coach::default(),
+            undo: None,
         }
     }
 
@@ -516,7 +607,11 @@ impl<Game: Oracle> Component for Client<Game> {
                     }
                 } else if changed_button == primary_button {
                     // mouse up
-                    self.click(tile_id);
+                    if self.is_lost() {
+                        self.coach.inspect(tile_id);
+                    } else {
+                        self.click(tile_id);
+                    }
                 }
                 self.unswap_controls_if_game_over();
             }
@@ -538,7 +633,9 @@ impl<Game: Oracle> Component for Client<Game> {
                 };
                 if tile_id == touch_start_tile_id {
                     let is_hold = Date::new_0().get_time() - date > 120.0;
-                    if is_hold ^ self.controls_swapped {
+                    if self.is_lost() {
+                        self.coach.inspect(tile_id);
+                    } else if is_hold ^ self.controls_swapped {
                         self.secondary_click(tile_id);
                     } else {
                         self.click(tile_id);
@@ -577,7 +674,22 @@ impl<Game: Oracle> Component for Client<Game> {
                 self.save_theme();
             }
             Msg::SwapControls => self.controls_swapped = !self.controls_swapped,
+            Msg::Hint => {
+                if let Some(game) = &self.game {
+                    if game.status().is_ongoing() {
+                        let anchor = self.last_revealed.first().copied();
+                        self.coach.advance_hint(self.game_config, game, anchor);
+                    }
+                }
+            }
+            Msg::Undo => self.undo_last_click(),
+            Msg::ToggleCoach => self.coach.open = !self.coach.open,
+            Msg::FocusCulprit => self.coach.focus_on(Focus::Culprit),
+            Msg::SelectMove(i) => self.coach.select_move(i),
+            Msg::SelectStep(i) => self.coach.step = i,
+            Msg::ToggleEarlier => self.coach.show_earlier = !self.coach.show_earlier,
         }
+        self.refresh_coach();
         true
     }
 
@@ -589,14 +701,12 @@ impl<Game: Oracle> Component for Client<Game> {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         let scope = ctx.link();
-        let analyzer = self.game.as_ref().and_then(|game| {
-            game.status().is_game_over().then(|| {
-                let mut analyzer = Analyzer::new(self.game_config);
-                analyzer.update_from(game);
-                analyzer.find_safe_moves(true);
-                analyzer
-            })
-        });
+        let analyzer = self.coach.post.as_ref().map(|post| &post.analyzer);
+        let game_over = self
+            .game
+            .as_ref()
+            .is_some_and(|game| game.status().is_game_over());
+        let highlights = self.coach.highlights();
         let stop_propagation = |e: MouseEvent| e.stop_propagation();
         self.update_css_board_width();
         html! {<>
@@ -618,6 +728,12 @@ impl<Game: Oracle> Component for Client<Game> {
                     </p>
                     <p>
                         { "When the game is over, you may quickly start a new game by clicking any tile with both mouse buttons simultaneously." }
+                    </p>
+                    <p>
+                        <strong>{ "Pattern coach: " }</strong>
+                        { "if you lose, the coach names the pattern (1-1, 1-2, 1-2-1, …) that showed the tile was a mine and the safe moves you had, and highlights the numbers involved. Click any hidden tile afterwards to see why it was safe or a mine. The " }
+                        <em>{ "Hint" }</em>
+                        { " button does the same during a game (a game with hints won't set a best time)." }
                     </p>
                     <div id="options">
                         <div>
@@ -800,6 +916,7 @@ impl<Game: Oracle> Component for Client<Game> {
                 <Timer
                     show_timer={self.theme.show_timer}
                     game_config={self.game_config}
+                    assisted={self.coach.hints_used}
                     timer_mode={
                         match self.game.as_ref().map(Game::status) {
                             None => TimerMode::Reset,
@@ -838,7 +955,7 @@ impl<Game: Oracle> Component for Client<Game> {
                             <tr>
                             {
                                 for row.map(|tile_id| {
-                                    self.view_tile(tile_id, analyzer.as_ref(), scope)
+                                    self.view_tile(tile_id, analyzer, &highlights, scope)
                                 })
                             }
                             </tr>
@@ -851,7 +968,7 @@ impl<Game: Oracle> Component for Client<Game> {
                     { "Options & Info" }
                 </button>
                 <button onclick={scope.callback(|_| Msg::SwapControls)}
-                        disabled={self.game.is_none() || analyzer.is_some()}>
+                        disabled={self.game.is_none() || game_over}>
                     { "Mode: " }
                     {
                         if self.controls_swapped {
@@ -861,11 +978,33 @@ impl<Game: Oracle> Component for Client<Game> {
                         }
                     }
                 </button>
+                <button onclick={scope.callback(|_| Msg::Hint)}
+                        title="Points out the easiest pattern available, then shows how it works"
+                        disabled={self.game.is_none() || game_over}>
+                    {
+                        match self.coach.hint_stage() {
+                            None => "💡 Hint",
+                            Some(1) => "💡 Show answer",
+                            Some(_) => "💡 Hide hint",
+                        }
+                    }
+                </button>
+                {
+                    if self.is_lost() && self.undo.is_some() {
+                        html! {
+                            <button class="undo-button" onclick={scope.callback(|_| Msg::Undo)}
+                                    title="Restore the board to just before your last click">
+                                { "↩ Undo click" }
+                            </button>
+                        }
+                    } else { html! {} }
+                }
                 <button onclick={scope.callback(|_| Msg::NewGame)}
                         disabled={self.game.is_none()}>
                     { "New Game" }
                 </button>
             </div>
+            { self.view_coach(scope) }
         </>}
     }
 }

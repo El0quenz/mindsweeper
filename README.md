@@ -1,5 +1,9 @@
 # Mindsweeper — a principled take on minesweeper
 
+> This is a fork of [alexbuz/mindsweeper](https://github.com/alexbuz/mindsweeper) (GPL-3.0) that adds a
+> **Pattern coach**: after a mistake it names the minesweeper pattern you missed and explains it
+> (see feature 8 below). Everything else is the original game.
+
 To play, visit https://alexbuz.github.io/mindsweeper/. Once the page loads, no further internet
 connection is required.
 
@@ -48,6 +52,20 @@ milliseconds after you make your first click.
       there is no first-click delay.
 7. Completely offline
     - Mindsweeper does not depend on a server. All of the code runs locally in your browser.
+8. Pattern coach
+    - After a loss (click any unrevealed tile), a side panel names the pattern that would have
+      proven that tile safe or a mine (1-1, 1-2, 1-2-1, 1-2-2-1, overlap, mine
+      counting, "what-if" contradiction, ...), highlights the numbers involved with A/B/C/D labels,
+      explains the reasoning in words, and lists other tiles the same pattern would have solved.
+      Reductions (e.g. 1-1R) are worked out on the "mines still needed" count.
+    - After a loss, **Undo click** restores the board to just before the losing click so you can
+      keep playing with the explanation still on screen. The clock resumes, and the game no longer
+      counts for best times.
+    - The **Hint** button gives a nudge first ("look here"), then the full explanation. Using it
+      disables best-time recording for that game.
+    - Every explanation is derived only from the visible numbers, and is tested against the
+      exhaustive solver for soundness (`cargo test explain`). "Overlap" is the general two-numbers rule behind the C-shapes, holes and triangles. Patterns beyond the named ones are
+      shown as generic overlap / what-if reasoning.
 
 ## Building from source
 

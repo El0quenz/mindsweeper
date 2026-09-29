@@ -231,7 +231,7 @@ impl Default for GameConfig {
     }
 }
 
-pub trait Oracle: Serialize + for<'a> Deserialize<'a> + 'static {
+pub trait Oracle: Clone + Serialize + for<'a> Deserialize<'a> + 'static {
     fn new(config: GameConfig, first_click_id: usize) -> Self;
 
     fn config(&self) -> GameConfig;

@@ -30,7 +30,7 @@ impl Tile {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LocalGame {
     config: GameConfig,
     tiles: Vec<Tile>,

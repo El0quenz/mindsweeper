@@ -20,6 +20,7 @@ pub enum TimerMode {
 pub struct TimerProps {
     pub show_timer: ShowTimer,
     pub game_config: GameConfig,
+    pub assisted: bool,
     pub timer_mode: TimerMode,
 }
 
@@ -94,7 +95,18 @@ impl Component for Timer {
                 self.interval.take().map(Interval::cancel);
             }
             TimerMode::Running => {
-                self.start_date = Some(Date::new_0());
+                // Coming back from a lost game (undo): carry on where the clock stopped.
+                let resumed = match (&old_props.timer_mode, &self.start_date, &self.stop_date) {
+                    (TimerMode::Stopped { won_game: false }, Some(start), Some(stop)) => {
+                        let paused = Date::new_0().get_time() - stop.get_time();
+                        let shifted = Date::new_0();
+                        shifted.set_time(start.get_time() + paused);
+                        Some(shifted)
+                    }
+                    _ => None,
+                };
+                self.stop_date = None;
+                self.start_date = Some(resumed.unwrap_or_else(Date::new_0));
                 self.interval = Some(Interval::new(0, {
                     let scope = ctx.link().clone();
                     move || scope.send_message(TimerMsg::Tick)
@@ -103,7 +115,7 @@ impl Component for Timer {
             TimerMode::Stopped { won_game } => {
                 self.stop_date = Some(Date::new_0());
                 self.interval.take().map(Interval::cancel);
-                if won_game {
+                if won_game && !new_props.assisted {
                     let time = self.elapsed_secs();
                     if self
                         .best_times
